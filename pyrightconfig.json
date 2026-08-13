@@ -1,0 +1,17 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "typeCheckingMode": "off",
+  "reportMissingImports": false,
+  "reportMissingTypeStubs": false,
+  "reportMissingModuleSource": "none",
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false,
+  "reportAttributeAccessIssue": false,
+  "reportGeneralTypeIssues": false,
+  "reportOptionalSubscript": false,
+  "reportOptionalMemberAccess": false
+}
