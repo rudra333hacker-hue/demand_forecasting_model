@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from ai_engine import predict_demand
 from newsvendor_engine import optimize_order_quantity, allocate_portfolio_budget
 from mcp_server import tool_log_manual_demand
+from populate_db import populate_database
 
 from fastapi.responses import FileResponse
 
@@ -21,6 +22,12 @@ app = FastAPI(
     description="Kirana store demand forecasting, newsvendor optimization, and AI insights API.",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+def startup_event():
+    if not os.path.exists("inveniq.db"):
+        print("inveniq.db not found. Auto-populating database on startup...")
+        populate_database()
 
 # CORS middleware for cross-origin frontend access
 app.add_middleware(
@@ -583,3 +590,9 @@ def get_khata_ledger():
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error fetching Khata ledger: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
