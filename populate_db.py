@@ -6,6 +6,15 @@ def populate_database():
     conn = sqlite3.connect("inveniq.db")
     cursor = conn.cursor()
 
+    # 0. Drop existing tables if schema is updating
+    cursor.execute("DROP TABLE IF EXISTS sales_history")
+    cursor.execute("DROP TABLE IF EXISTS manual_demand_logs")
+    cursor.execute("DROP TABLE IF EXISTS skus")
+    cursor.execute("DROP TABLE IF EXISTS khata_ledger")
+    cursor.execute("DROP TABLE IF EXISTS promotions")
+    cursor.execute("DROP TABLE IF EXISTS holidays_calendar")
+    cursor.execute("DROP TABLE IF EXISTS supplier_lead_times")
+
     # 1. Create Tables
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS skus (
@@ -14,7 +23,9 @@ def populate_database():
         category TEXT NOT NULL,
         unit_cost REAL NOT NULL,
         selling_price REAL NOT NULL,
-        current_stock INTEGER NOT NULL
+        current_stock INTEGER NOT NULL,
+        location_id TEXT DEFAULT 'LOC_001',
+        substitute_sku_id TEXT
     )
     """)
 
@@ -24,6 +35,7 @@ def populate_database():
         sku_id TEXT NOT NULL,
         date TEXT NOT NULL,
         quantity_sold REAL NOT NULL,
+        location_id TEXT DEFAULT 'LOC_001',
         FOREIGN KEY (sku_id) REFERENCES skus (sku_id)
     )
     """)
@@ -35,6 +47,7 @@ def populate_database():
         date TEXT NOT NULL,
         unmet_quantity INTEGER NOT NULL,
         customer_segment TEXT DEFAULT 'Regular',
+        location_id TEXT DEFAULT 'LOC_001',
         FOREIGN KEY (sku_id) REFERENCES skus (sku_id)
     )
     """)
@@ -87,15 +100,15 @@ def populate_database():
     cursor.execute("DELETE FROM holidays_calendar")
     cursor.execute("DELETE FROM supplier_lead_times")
 
-    # 2. Insert SKUs
+    # 2. Insert SKUs (sku_id, name, category, unit_cost, selling_price, current_stock, location_id, substitute_sku_id)
     skus_data = [
-        ("SKU_001", "Basmati Rice 5kg", "Staples", 250.0, 320.0, 50),
-        ("SKU_002", "Full Cream Milk 1L", "Dairy", 45.0, 55.0, 30),
-        ("SKU_003", "Mango Drink 1L", "Beverages", 65.0, 90.0, 20),
-        ("SKU_004", "Potato Chips 100g", "Snacks", 15.0, 20.0, 40),
-        ("SKU_005", "Toor Dal 1kg", "Staples", 110.0, 140.0, 25),
+        ("SKU_001", "Basmati Rice 5kg", "Staples", 250.0, 320.0, 50, "LOC_001", "SKU_005"),
+        ("SKU_002", "Full Cream Milk 1L", "Dairy", 45.0, 55.0, 30, "LOC_001", None),
+        ("SKU_003", "Mango Drink 1L", "Beverages", 65.0, 90.0, 20, "LOC_001", "SKU_004"),
+        ("SKU_004", "Potato Chips 100g", "Snacks", 15.0, 20.0, 40, "LOC_001", "SKU_003"),
+        ("SKU_005", "Toor Dal 1kg", "Staples", 110.0, 140.0, 25, "LOC_001", "SKU_001"),
     ]
-    cursor.executemany("INSERT INTO skus VALUES (?, ?, ?, ?, ?, ?)", skus_data)
+    cursor.executemany("INSERT INTO skus VALUES (?, ?, ?, ?, ?, ?, ?, ?)", skus_data)
 
     # 3. Generate daily time-series sales history for 60 days
     base_date = datetime.date(2026, 6, 15)
