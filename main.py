@@ -1,0 +1,585 @@
+import os
+import json
+import requests
+from typing import List, Optional, Dict, Any
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from ai_engine import predict_demand
+from newsvendor_engine import optimize_order_quantity, allocate_portfolio_budget
+from mcp_server import tool_log_manual_demand
+
+from fastapi.responses import FileResponse
+
+app = FastAPI(
+    title="Smart Restock AI API",
+    description="Kirana store demand forecasting, newsvendor optimization, and AI insights API.",
+    version="1.0.0"
+)
+
+# CORS middleware for cross-origin frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Pydantic Models for Input Validation ---
+
+class ForecastRequest(BaseModel):
+    sku_id: str = Field(..., examples=["SKU_001"])
+    is_festival: int = Field(0, description="1 if festival season, 0 otherwise", examples=[0])
+    city: str = Field("Hyderabad", examples=["Hyderabad"])
+    date_str: Optional[str] = Field(None, description="Optional target forecast date YYYY-MM-DD", examples=["2026-08-15"])
+
+
+class OptimizeRestockRequest(BaseModel):
+    sku_ids: List[str] = Field(..., examples=[["SKU_001", "SKU_002", "SKU_003"]])
+    daily_budget: float = Field(..., gt=0, examples=[5000.0])
+    customer_id: Optional[str] = Field(None, examples=["CUST_101"])
+
+
+class LogDemandRequest(BaseModel):
+    sku_id: str = Field(..., examples=["SKU_001"])
+    date_str: str = Field(..., examples=["2026-08-13"])
+    unmet_quantity: int = Field(..., gt=0, examples=[5])
+    segment: str = Field("Regular", examples=["Regular"])
+
+
+class KhataVoiceNoteRequest(BaseModel):
+    customer_id: str = Field(..., examples=["CUST_001"])
+    note: str = Field(..., examples=["Added 2 Rice bags to Khata ₹640"])
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., examples=["Which items should I restock today?"])
+
+
+class UpdateSKURequest(BaseModel):
+    sku_id: str = Field(..., examples=["SKU_001"])
+    unit_cost: float = Field(..., gt=0, examples=[250.0])
+    selling_price: float = Field(..., gt=0, examples=[320.0])
+    current_stock: int = Field(..., ge=0, examples=[50])
+
+
+class AddSKURequest(BaseModel):
+    sku_id: Optional[str] = Field(None, examples=["SKU_006"])
+    name: str = Field(..., examples=["Wheat Flour 10kg"])
+    category: str = Field("Staples", examples=["Staples"])
+    unit_cost: float = Field(..., gt=0, examples=[300.0])
+    selling_price: float = Field(..., gt=0, examples=[380.0])
+    current_stock: int = Field(..., ge=0, examples=[20])
+
+
+# --- API Routes ---
+
+@app.get("/")
+def serve_dashboard():
+    """
+    Serves the KiranaIQ Smart Restock HTML web dashboard.
+    """
+    if os.path.exists("index.html"):
+        return FileResponse("index.html")
+    return {
+        "status": "healthy",
+        "service": "Smart Restock AI Engine API",
+        "version": "1.0.0"
+    }
+
+
+@app.get("/health")
+def health_check():
+    """
+    1. Health check endpoint.
+    """
+    return {
+        "status": "healthy",
+        "service": "Smart Restock AI Engine API",
+        "version": "1.0.0"
+    }
+
+
+@app.post("/forecast")
+def get_forecast(req: ForecastRequest):
+    """
+    2. Takes sku_id and returns AI demand forecast from ai_engine.py.
+    """
+    try:
+        forecast = predict_demand(
+            sku_id=req.sku_id,
+            is_festival=req.is_festival,
+            city=req.city,
+            date_str=req.date_str
+        )
+        return forecast
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Forecast error for SKU '{req.sku_id}': {str(e)}")
+
+
+@app.post("/optimize-restock")
+def optimize_restock(req: OptimizeRestockRequest):
+    """
+    3. Takes a list of sku_ids and daily_budget, runs optimize_order_quantity,
+       and passes results to allocate_portfolio_budget.
+    """
+    try:
+        orders_list = []
+        for sku_id in req.sku_ids:
+            # Step A: Get demand forecast
+            forecast = predict_demand(sku_id=sku_id)
+            predicted_demand = forecast.get("final_predicted_demand", 0.0)
+
+            # Step B: Compute Newsvendor optimal order quantity (Q*)
+            order_info = optimize_order_quantity(
+                sku_id=sku_id,
+                raw_demand_forecast=predicted_demand
+            )
+            orders_list.append(order_info)
+
+        # Step C: Allocate portfolio budget
+        allocation_plan = allocate_portfolio_budget(
+            orders_list=orders_list,
+            total_budget_inr=req.daily_budget,
+            customer_id=req.customer_id
+        )
+        return allocation_plan
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Restock optimization error: {str(e)}")
+
+
+@app.post("/log-demand")
+def log_unmet_demand(req: LogDemandRequest):
+    """
+    4. Calls tool_log_manual_demand from mcp_server.py to record unfulfilled demand.
+    """
+    try:
+        result = tool_log_manual_demand(
+            sku_id=req.sku_id,
+            date_str=req.date_str,
+            unmet_quantity=req.unmet_quantity,
+            segment=req.segment
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error logging manual demand: {str(e)}")
+
+
+@app.post("/generate-nim-insights")
+def generate_nim_insights(payload: Dict[str, Any]):
+    """
+    5. Takes the restock JSON plan, calls NVIDIA NIM API (meta/llama-3.1-8b-instruct)
+       using NVIDIA_API_KEY, and returns a 2-sentence plain-language recommendation for the shopkeeper.
+       Includes fallback logic if key or network call fails.
+    """
+    fallback_recommendation = (
+        "Prioritize restocking high Critical Fractile items like staple foods to maximize profit margins under your budget. "
+        "Continuously log unfulfilled customer demand to dynamically refine stock targets for upcoming days."
+    )
+
+    restock_plan = payload.get("restock_plan", payload)
+    api_key = os.getenv("NVIDIA_API_KEY")
+
+    if not api_key:
+        return {
+            "status": "fallback",
+            "source": "fallback_rules_engine",
+            "recommendation": fallback_recommendation,
+            "reason": "NVIDIA_API_KEY environment variable not configured."
+        }
+
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    prompt_content = f"Restock Plan: {json.dumps(restock_plan, indent=2)}"
+
+    body = {
+        "model": "meta/llama-3.1-8b-instruct",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert Kirana store inventory advisor. "
+                    "Based on the provided restock optimization plan, generate exactly a 2-sentence, "
+                    "plain-language actionable recommendation for the shopkeeper."
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt_content
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 150
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            recommendation = data["choices"][0]["message"]["content"].strip()
+            return {
+                "status": "success",
+                "source": "nvidia_nim_nemotron",
+                "recommendation": recommendation
+            }
+        else:
+            return {
+                "status": "fallback",
+                "source": "fallback_rules_engine",
+                "recommendation": fallback_recommendation,
+                "reason": f"NVIDIA NIM API error {response.status_code}: {response.text}"
+            }
+    except Exception as exc:
+        return {
+            "status": "fallback",
+            "source": "fallback_rules_engine",
+            "recommendation": fallback_recommendation,
+            "reason": f"Network exception while calling NVIDIA NIM API: {str(exc)}"
+        }
+
+
+@app.post("/save-khata-note")
+def save_khata_note(req: KhataVoiceNoteRequest):
+    """
+    6. Persists a Khata voice/text note for a customer.
+    Stores the note in the khata_notes table.
+    """
+    import sqlite3
+    from mcp_server import DB_PATH, tool_update_khata_balance
+    from datetime import datetime
+    import re
+
+    try:
+        # Extract numerical amount if present in note (e.g. ₹640 or 640)
+        amounts = re.findall(r'(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)', req.note, re.IGNORECASE)
+        if amounts:
+            try:
+                delta = float(amounts[-1])
+                if delta > 0:
+                    tool_update_khata_balance(req.customer_id, delta)
+            except Exception as ex:
+                print("Could not update khata balance from note:", ex)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS khata_notes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    customer_id TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute(
+                "INSERT INTO khata_notes (customer_id, note, created_at) VALUES (?, ?, ?)",
+                (req.customer_id, req.note, datetime.now().isoformat())
+            )
+            conn.commit()
+        return {
+            "status": "success",
+            "customer_id": req.customer_id,
+            "note": req.note,
+            "message": "Khata note saved and balance updated successfully."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error saving Khata note: {str(e)}")
+
+
+def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
+    """
+    Parses natural language commands from the shopkeeper to update inveniq.db.
+    Supports stock updates, price updates, cost updates, and missing demand logging.
+    """
+    import re
+    import sqlite3
+    from mcp_server import DB_PATH
+    from datetime import datetime
+
+    msg_lower = message.lower().strip()
+
+    try:
+        # Load existing SKUs from database
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT sku_id, name, category, unit_cost, selling_price, current_stock FROM skus")
+            skus = cursor.fetchall()
+
+        # Find target SKU by matching ID or name keywords
+        target_sku = None
+        for s in skus:
+            sku_id, name, cat, cost, price, stock = s
+            # Direct SKU ID match
+            if sku_id.lower() in msg_lower:
+                target_sku = s
+                break
+            # Name keyword match
+            name_words = [w.lower() for w in name.split() if len(w) > 3]
+            if any(w in msg_lower for w in name_words):
+                target_sku = s
+                break
+
+        # Extract numeric values
+        numbers = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', message)]
+
+        # 1. Update Stock
+        if any(k in msg_lower for k in ["stock", "quantity", "inventory", "count"]) and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "add" in msg_lower or "make" in msg_lower):
+            if target_sku and numbers:
+                new_stock = int(numbers[-1])
+                sku_id, name, cat, cost, price, old_stock = target_sku
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE skus SET current_stock = ? WHERE sku_id = ?", (new_stock, sku_id))
+                    conn.commit()
+                return {
+                    "reply": f"Updated {name} ({sku_id}) stock from {old_stock} to {new_stock} units in database! Restock plan recalculated.",
+                    "db_updated": True
+                }
+
+        # 2. Update Selling Price
+        if "price" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
+            if target_sku and numbers:
+                new_price = float(numbers[-1])
+                sku_id, name, cat, cost, old_price, stock = target_sku
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE skus SET selling_price = ? WHERE sku_id = ?", (new_price, sku_id))
+                    conn.commit()
+                return {
+                    "reply": f"Updated {name} ({sku_id}) selling price from ₹{old_price} to ₹{new_price} in database!",
+                    "db_updated": True
+                }
+
+        # 3. Update Unit Cost
+        if "cost" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
+            if target_sku and numbers:
+                new_cost = float(numbers[-1])
+                sku_id, name, cat, old_cost, price, stock = target_sku
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE skus SET unit_cost = ? WHERE sku_id = ?", (new_cost, sku_id))
+                    conn.commit()
+                return {
+                    "reply": f"Updated {name} ({sku_id}) unit cost from ₹{old_cost} to ₹{new_cost} in database!",
+                    "db_updated": True
+                }
+
+        # 4. Log Missing / Unmet Demand
+        if any(k in msg_lower for k in ["missing", "unmet", "stockout", "out of stock", "shortage"]):
+            if target_sku and numbers:
+                missing_qty = int(numbers[0])
+                sku_id, name, cat, cost, price, stock = target_sku
+                today = datetime.now().strftime("%Y-%m-%d")
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT INTO manual_demand_logs (sku_id, date, unmet_quantity, customer_segment) VALUES (?, ?, ?, ?)", (sku_id, today, missing_qty, "Regular"))
+                    conn.commit()
+                return {
+                    "reply": f"Logged {missing_qty} missing units for {name} ({sku_id}) on {today}! Demand AI will factor this into upcoming forecasts.",
+                    "db_updated": True
+                }
+
+        # 5. Update Khata Debit Balance
+        if any(k in msg_lower for k in ["khata", "debit", "credit", "balance", "owe", "due"]):
+            if numbers:
+                amount = float(numbers[-1])
+                from mcp_server import tool_update_khata_balance
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT customer_id, customer_name, debit_balance FROM khata_ledger")
+                    customers = cursor.fetchall()
+                target_cust = None
+                for c in customers:
+                    cid, cname, bal = c
+                    if cid.lower() in msg_lower or any(w.lower() in msg_lower for w in cname.split() if len(w) > 2):
+                        target_cust = c
+                        break
+                if target_cust:
+                    cid, cname, old_bal = target_cust
+                    tool_update_khata_balance(cid, amount)
+                    return {
+                        "reply": f"Added ₹{amount:.2f} to {cname} ({cid}) Khata! New balance updated in database and restock reserve recalculated.",
+                        "db_updated": True
+                    }
+
+    except Exception as e:
+        print("Error executing chat DB command:", e)
+
+    return None
+
+
+@app.post("/chat")
+def chat_with_assistant(req: ChatRequest):
+    """
+    7. Interactive Voice & Text Assistant Endpoint powered by NVIDIA NIM.
+    Automatically detects and executes database updates from user natural language commands.
+    """
+    # Step 1: Check if the message is a database modification command
+    db_result = execute_chat_db_command(req.message)
+    if db_result:
+        return db_result
+
+    # Step 2: Fallback to NVIDIA NIM AI response for advice or questions
+    fallback_reply = (
+        "Focus on maintaining stock levels for high-margin staples and dairy. "
+        "Log missing demand daily so your dynamic restock targets adjust automatically."
+    )
+
+    api_key = os.getenv("NVIDIA_API_KEY")
+
+    if not api_key:
+        return {"reply": fallback_reply, "db_updated": False}
+
+    url = "https://integrate.api.nvidia.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    body = {
+        "model": "meta/llama-3.1-8b-instruct",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are KiranaIQ Assistant, an AI inventory advisor for Indian Kirana shopkeepers. "
+                    "Answer concisely in 2 short sentences."
+                )
+            },
+            {
+                "role": "user",
+                "content": req.message
+            }
+        ],
+        "temperature": 0.3,
+        "max_tokens": 120
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=body, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+            return {"reply": reply, "db_updated": False}
+        else:
+            return {"reply": fallback_reply, "db_updated": False}
+    except Exception:
+        return {"reply": fallback_reply, "db_updated": False}
+
+
+# --- SKU & Inventory Database Management Endpoints ---
+
+@app.get("/skus")
+def get_all_skus():
+    """
+    Returns all SKUs from inveniq.db.
+    """
+    import sqlite3
+    from mcp_server import DB_PATH
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT sku_id, name, category, unit_cost, selling_price, current_stock FROM skus")
+            rows = cursor.fetchall()
+        return [
+            {
+                "sku_id": r[0],
+                "item_name": r[1],
+                "category": r[2],
+                "unit_cost": r[3],
+                "selling_price": r[4],
+                "current_stock": r[5]
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching SKUs: {str(e)}")
+
+
+@app.post("/update-sku")
+def update_sku(req: UpdateSKURequest):
+    """
+    Updates cost, selling price, and current stock for a SKU.
+    """
+    import sqlite3
+    from mcp_server import DB_PATH
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE skus SET unit_cost = ?, selling_price = ?, current_stock = ? WHERE sku_id = ?",
+                (req.unit_cost, req.selling_price, req.current_stock, req.sku_id)
+            )
+            conn.commit()
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"SKU '{req.sku_id}' not found.")
+        return {"status": "success", "message": "SKU updated successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error updating SKU: {str(e)}")
+
+
+@app.post("/add-sku")
+def add_sku(req: AddSKURequest):
+    """
+    Adds a new SKU to inveniq.db.
+    """
+    import sqlite3
+    from mcp_server import DB_PATH
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            if not req.sku_id:
+                cursor.execute("SELECT COUNT(*) FROM skus")
+                count = cursor.fetchone()[0] + 1
+                sku_id = f"SKU_{count:03d}"
+            else:
+                sku_id = req.sku_id
+
+            cursor.execute(
+                "INSERT INTO skus (sku_id, name, category, unit_cost, selling_price, current_stock) VALUES (?, ?, ?, ?, ?, ?)",
+                (sku_id, req.name, req.category, req.unit_cost, req.selling_price, req.current_stock)
+            )
+            conn.commit()
+        return {"status": "success", "message": "New SKU added", "sku_id": sku_id}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail=f"SKU with ID '{req.sku_id}' already exists.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error adding SKU: {str(e)}")
+
+
+@app.get("/khata-ledger")
+def get_khata_ledger():
+    """
+    Returns all customer Khata entries from inveniq.db.
+    """
+    import sqlite3
+    from mcp_server import DB_PATH
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT customer_id, customer_name, segment, debit_balance FROM khata_ledger")
+            rows = cursor.fetchall()
+        return [
+            {
+                "customer_id": r[0],
+                "customer_name": r[1],
+                "segment": r[2],
+                "debit_balance": r[3]
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching Khata ledger: {str(e)}")
