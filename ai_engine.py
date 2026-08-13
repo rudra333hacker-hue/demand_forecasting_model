@@ -281,7 +281,8 @@ def predict_demand(
     sku_id: str,
     is_festival: int = 0,
     city: str = "Hyderabad",
-    date_str: Optional[str] = None
+    date_str: Optional[str] = None,
+    location_id: Optional[str] = None
 ) -> dict:
     """
     Main Multi-Factor Demand Forecasting Engine:
@@ -289,7 +290,8 @@ def predict_demand(
     2. Reconstructs latent true demand from sales history + unmet stockouts.
     3. Runs inference on neural LSTM vs. Ridge Regression.
     4. Evaluates Weather, Holiday/Event, Promotional Elasticity, and Day-of-Week Seasonality Multipliers.
-    5. Returns transparent multi-factor breakdown.
+    5. Computes Uncertainty Bands (95% Confidence Interval) and Anomaly/Regime Flag.
+    6. Returns transparent multi-factor breakdown.
     """
     metadata = get_sku_metadata(sku_id)
     category = metadata.get("category", "Staples")
@@ -316,6 +318,28 @@ def predict_demand(
     combined_multiplier = round(weather_multiplier * dow_multiplier * promo_multiplier * holiday_multiplier, 2)
     final_predicted_demand = predicted_demand_raw * combined_multiplier
 
+    # --- Uncertainty Bands & Anomaly / Regime Flagging ---
+    hist_std = float(np.std(demand_series)) if len(demand_series) > 1 and np.std(demand_series) > 0 else max(1.0, final_predicted_demand * 0.15)
+    hist_mean = float(np.mean(demand_series)) if len(demand_series) > 0 else final_predicted_demand
+
+    ci_margin = 1.96 * hist_std
+    ci_low = round(max(0.0, final_predicted_demand - ci_margin), 1)
+    ci_high = round(final_predicted_demand + ci_margin, 1)
+
+    # Simple rule-based anomaly detection (>2 std dev threshold)
+    latest_val = float(demand_series[-1]) if len(demand_series) > 0 else final_predicted_demand
+    z_score = abs(latest_val - hist_mean) / hist_std if hist_std > 0 else 0.0
+
+    if z_score > 2.0 or (combined_multiplier >= 1.35):
+        anomaly_flag = True
+        if z_score > 2.0:
+            anomaly_reason = f"Demand spike detected ({z_score:.1f} std dev above historical average)"
+        else:
+            anomaly_reason = f"High demand regime detected (combined multiplier {combined_multiplier:.2f}x)"
+    else:
+        anomaly_flag = False
+        anomaly_reason = None
+
     return {
         "sku_id": sku_id,
         "predicted_demand_raw": round(predicted_demand_raw, 1),
@@ -326,6 +350,12 @@ def predict_demand(
         "combined_multiplier": combined_multiplier,
         "final_predicted_demand": round(final_predicted_demand, 1),
         "model_used": model_used,
+        "confidence_interval": {
+            "low": ci_low,
+            "high": ci_high
+        },
+        "anomaly_flag": anomaly_flag,
+        "anomaly_reason": anomaly_reason,
         "factor_breakdown": {
             "latent_demand_reconstructed": True,
             "weather_impact": f"{(weather_multiplier - 1.0)*100:+.0f}%",
