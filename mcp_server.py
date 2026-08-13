@@ -16,7 +16,7 @@ def tool_get_sales_history(sku_id: str, location_id: Optional[str] = None, limit
     Supports optional location_id filtering and date_range filtering.
     """
     query = "SELECT date, quantity_sold FROM sales_history WHERE sku_id = ?"
-    params = [sku_id]
+    params: List[Any] = [sku_id]
 
     if location_id:
         query += " AND location_id = ?"
