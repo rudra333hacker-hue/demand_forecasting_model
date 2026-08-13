@@ -12,7 +12,17 @@ from pydantic import BaseModel, Field
 
 from ai_engine import predict_demand
 from newsvendor_engine import optimize_order_quantity, allocate_portfolio_budget
-from mcp_server import tool_log_manual_demand
+from mcp_server import (
+    tool_get_sales_history,
+    tool_get_current_stock,
+    tool_get_product_cost,
+    tool_log_manual_demand,
+    tool_get_khata_ledger,
+    tool_get_all_skus,
+    tool_update_sku_metadata,
+    tool_add_new_sku,
+    tool_update_khata_balance
+)
 from populate_db import populate_database
 
 from fastapi.responses import FileResponse
@@ -45,12 +55,14 @@ class ForecastRequest(BaseModel):
     is_festival: int = Field(0, description="1 if festival season, 0 otherwise", examples=[0])
     city: str = Field("Hyderabad", examples=["Hyderabad"])
     date_str: Optional[str] = Field(None, description="Optional target forecast date YYYY-MM-DD", examples=["2026-08-15"])
+    location_id: Optional[str] = Field(None, description="Optional location ID", examples=["LOC_001"])
 
 
 class OptimizeRestockRequest(BaseModel):
     sku_ids: List[str] = Field(..., examples=[["SKU_001", "SKU_002", "SKU_003"]])
     daily_budget: float = Field(..., gt=0, examples=[5000.0])
     customer_id: Optional[str] = Field(None, examples=["CUST_101"])
+    location_id: Optional[str] = Field(None, description="Optional location ID", examples=["LOC_001"])
 
 
 class LogDemandRequest(BaseModel):
@@ -58,6 +70,7 @@ class LogDemandRequest(BaseModel):
     date_str: str = Field(..., examples=["2026-08-13"])
     unmet_quantity: int = Field(..., gt=0, examples=[5])
     segment: str = Field("Regular", examples=["Regular"])
+    location_id: Optional[str] = Field(None, examples=["LOC_001"])
 
 
 class KhataVoiceNoteRequest(BaseModel):
@@ -74,6 +87,7 @@ class UpdateSKURequest(BaseModel):
     unit_cost: float = Field(..., gt=0, examples=[250.0])
     selling_price: float = Field(..., gt=0, examples=[320.0])
     current_stock: int = Field(..., ge=0, examples=[50])
+    location_id: Optional[str] = Field(None, examples=["LOC_001"])
 
 
 class AddSKURequest(BaseModel):
@@ -83,6 +97,7 @@ class AddSKURequest(BaseModel):
     unit_cost: float = Field(..., gt=0, examples=[300.0])
     selling_price: float = Field(..., gt=0, examples=[380.0])
     current_stock: int = Field(..., ge=0, examples=[20])
+    location_id: Optional[str] = Field(None, examples=["LOC_001"])
 
 
 # --- API Routes ---
@@ -123,7 +138,8 @@ def get_forecast(req: ForecastRequest):
             sku_id=req.sku_id,
             is_festival=req.is_festival,
             city=req.city,
-            date_str=req.date_str
+            date_str=req.date_str,
+            location_id=req.location_id
         )
         return forecast
     except Exception as e:
@@ -140,13 +156,14 @@ def optimize_restock(req: OptimizeRestockRequest):
         orders_list = []
         for sku_id in req.sku_ids:
             # Step A: Get demand forecast
-            forecast = predict_demand(sku_id=sku_id)
+            forecast = predict_demand(sku_id=sku_id, location_id=req.location_id)
             predicted_demand = forecast.get("final_predicted_demand", 0.0)
 
             # Step B: Compute Newsvendor optimal order quantity (Q*)
             order_info = optimize_order_quantity(
                 sku_id=sku_id,
-                raw_demand_forecast=predicted_demand
+                raw_demand_forecast=predicted_demand,
+                location_id=req.location_id
             )
             orders_list.append(order_info)
 
@@ -154,7 +171,8 @@ def optimize_restock(req: OptimizeRestockRequest):
         allocation_plan = allocate_portfolio_budget(
             orders_list=orders_list,
             total_budget_inr=req.daily_budget,
-            customer_id=req.customer_id
+            customer_id=req.customer_id,
+            location_id=req.location_id
         )
         return allocation_plan
     except ValueError as ve:
@@ -173,7 +191,8 @@ def log_unmet_demand(req: LogDemandRequest):
             sku_id=req.sku_id,
             date_str=req.date_str,
             unmet_quantity=req.unmet_quantity,
-            segment=req.segment
+            customer_segment=req.segment,
+            location_id=req.location_id
         )
         return result
     except Exception as e:
@@ -260,16 +279,10 @@ def generate_nim_insights(payload: Dict[str, Any]):
 @app.post("/save-khata-note")
 def save_khata_note(req: KhataVoiceNoteRequest):
     """
-    6. Persists a Khata voice/text note for a customer.
-    Stores the note in the khata_notes table.
+    6. Persists a Khata voice/text note for a customer via MCP layer.
     """
-    import sqlite3
-    from mcp_server import DB_PATH, tool_update_khata_balance
-    from datetime import datetime
     import re
-
     try:
-        # Extract numerical amount if present in note (e.g. ₹640 or 640)
         amounts = re.findall(r'(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d+)?)', req.note, re.IGNORECASE)
         if amounts:
             try:
@@ -279,21 +292,6 @@ def save_khata_note(req: KhataVoiceNoteRequest):
             except Exception as ex:
                 print("Could not update khata balance from note:", ex)
 
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS khata_notes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    customer_id TEXT NOT NULL,
-                    note TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            cursor.execute(
-                "INSERT INTO khata_notes (customer_id, note, created_at) VALUES (?, ?, ?)",
-                (req.customer_id, req.note, datetime.now().isoformat())
-            )
-            conn.commit()
         return {
             "status": "success",
             "customer_id": req.customer_id,
@@ -306,51 +304,39 @@ def save_khata_note(req: KhataVoiceNoteRequest):
 
 def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
     """
-    Parses natural language commands from the shopkeeper to update inveniq.db.
-    Supports stock updates, price updates, cost updates, and missing demand logging.
+    Parses natural language commands from the shopkeeper and updates via MCP server tools.
     """
     import re
-    import sqlite3
-    from mcp_server import DB_PATH
     from datetime import datetime
 
     msg_lower = message.lower().strip()
 
     try:
-        # Load existing SKUs from database
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT sku_id, name, category, unit_cost, selling_price, current_stock FROM skus")
-            skus = cursor.fetchall()
-
-        # Find target SKU by matching ID or name keywords
+        skus = tool_get_all_skus()
         target_sku = None
         for s in skus:
-            sku_id, name, cat, cost, price, stock = s
-            # Direct SKU ID match
+            sku_id = s["sku_id"]
+            name = s["name"]
             if sku_id.lower() in msg_lower:
                 target_sku = s
                 break
-            # Name keyword match
             name_words = [w.lower() for w in name.split() if len(w) > 3]
             if any(w in msg_lower for w in name_words):
                 target_sku = s
                 break
 
-        # Extract numeric values
         numbers = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', message)]
 
         # 1. Update Stock
         if any(k in msg_lower for k in ["stock", "quantity", "inventory", "count"]) and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "add" in msg_lower or "make" in msg_lower):
             if target_sku and numbers:
                 new_stock = int(numbers[-1])
-                sku_id, name, cat, cost, price, old_stock = target_sku
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE skus SET current_stock = ? WHERE sku_id = ?", (new_stock, sku_id))
-                    conn.commit()
+                sku_id = target_sku["sku_id"]
+                name = target_sku["name"]
+                old_stock = target_sku["current_stock"]
+                tool_update_sku_metadata(sku_id=sku_id, current_stock=new_stock)
                 return {
-                    "reply": f"Updated {name} ({sku_id}) stock from {old_stock} to {new_stock} units in database! Restock plan recalculated.",
+                    "reply": f"Updated {name} ({sku_id}) stock from {old_stock} to {new_stock} units via MCP! Restock plan recalculated.",
                     "db_updated": True
                 }
 
@@ -358,13 +344,12 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
         if "price" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
             if target_sku and numbers:
                 new_price = float(numbers[-1])
-                sku_id, name, cat, cost, old_price, stock = target_sku
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE skus SET selling_price = ? WHERE sku_id = ?", (new_price, sku_id))
-                    conn.commit()
+                sku_id = target_sku["sku_id"]
+                name = target_sku["name"]
+                old_price = target_sku["selling_price"]
+                tool_update_sku_metadata(sku_id=sku_id, selling_price=new_price)
                 return {
-                    "reply": f"Updated {name} ({sku_id}) selling price from ₹{old_price} to ₹{new_price} in database!",
+                    "reply": f"Updated {name} ({sku_id}) selling price from ₹{old_price} to ₹{new_price} via MCP!",
                     "db_updated": True
                 }
 
@@ -372,13 +357,12 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
         if "cost" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
             if target_sku and numbers:
                 new_cost = float(numbers[-1])
-                sku_id, name, cat, old_cost, price, stock = target_sku
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE skus SET unit_cost = ? WHERE sku_id = ?", (new_cost, sku_id))
-                    conn.commit()
+                sku_id = target_sku["sku_id"]
+                name = target_sku["name"]
+                old_cost = target_sku["unit_cost"]
+                tool_update_sku_metadata(sku_id=sku_id, unit_cost=new_cost)
                 return {
-                    "reply": f"Updated {name} ({sku_id}) unit cost from ₹{old_cost} to ₹{new_cost} in database!",
+                    "reply": f"Updated {name} ({sku_id}) unit cost from ₹{old_cost} to ₹{new_cost} via MCP!",
                     "db_updated": True
                 }
 
@@ -386,14 +370,12 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
         if any(k in msg_lower for k in ["missing", "unmet", "stockout", "out of stock", "shortage"]):
             if target_sku and numbers:
                 missing_qty = int(numbers[0])
-                sku_id, name, cat, cost, price, stock = target_sku
+                sku_id = target_sku["sku_id"]
+                name = target_sku["name"]
                 today = datetime.now().strftime("%Y-%m-%d")
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("INSERT INTO manual_demand_logs (sku_id, date, unmet_quantity, customer_segment) VALUES (?, ?, ?, ?)", (sku_id, today, missing_qty, "Regular"))
-                    conn.commit()
+                tool_log_manual_demand(sku_id=sku_id, date_str=today, unmet_quantity=missing_qty, customer_segment="Regular")
                 return {
-                    "reply": f"Logged {missing_qty} missing units for {name} ({sku_id}) on {today}! Demand AI will factor this into upcoming forecasts.",
+                    "reply": f"Logged {missing_qty} missing units for {name} ({sku_id}) on {today} via MCP! Demand AI will factor this into upcoming forecasts.",
                     "db_updated": True
                 }
 
@@ -401,22 +383,21 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
         if any(k in msg_lower for k in ["khata", "debit", "credit", "balance", "owe", "due"]):
             if numbers:
                 amount = float(numbers[-1])
-                from mcp_server import tool_update_khata_balance
-                with sqlite3.connect(DB_PATH) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT customer_id, customer_name, debit_balance FROM khata_ledger")
-                    customers = cursor.fetchall()
+                customers = tool_get_khata_ledger()
                 target_cust = None
-                for c in customers:
-                    cid, cname, bal = c
-                    if cid.lower() in msg_lower or any(w.lower() in msg_lower for w in cname.split() if len(w) > 2):
-                        target_cust = c
-                        break
+                if isinstance(customers, list):
+                    for c in customers:
+                        cid = c["customer_id"]
+                        cname = c["customer_name"]
+                        if cid.lower() in msg_lower or any(w.lower() in msg_lower for w in cname.split() if len(w) > 2):
+                            target_cust = c
+                            break
                 if target_cust:
-                    cid, cname, old_bal = target_cust
+                    cid = target_cust["customer_id"]
+                    cname = target_cust["customer_name"]
                     tool_update_khata_balance(cid, amount)
                     return {
-                        "reply": f"Added ₹{amount:.2f} to {cname} ({cid}) Khata! New balance updated in database and restock reserve recalculated.",
+                        "reply": f"Added ₹{amount:.2f} to {cname} ({cid}) Khata via MCP! New balance updated and restock reserve recalculated.",
                         "db_updated": True
                     }
 
@@ -432,12 +413,10 @@ def chat_with_assistant(req: ChatRequest):
     7. Interactive Voice & Text Assistant Endpoint powered by NVIDIA NIM.
     Automatically detects and executes database updates from user natural language commands.
     """
-    # Step 1: Check if the message is a database modification command
     db_result = execute_chat_db_command(req.message)
     if db_result:
         return db_result
 
-    # Step 2: Fallback to NVIDIA NIM AI response for advice or questions
     fallback_reply = (
         "Focus on maintaining stock levels for high-margin staples and dairy. "
         "Log missing demand daily so your dynamic restock targets adjust automatically."
@@ -485,30 +464,26 @@ def chat_with_assistant(req: ChatRequest):
         return {"reply": fallback_reply, "db_updated": False}
 
 
-# --- SKU & Inventory Database Management Endpoints ---
+# --- SKU & Inventory Database Management Endpoints (All powered via MCP server tools) ---
 
 @app.get("/skus")
-def get_all_skus():
+def get_all_skus(location_id: Optional[str] = None):
     """
-    Returns all SKUs from inveniq.db.
+    Returns all SKUs from database via tool_get_all_skus MCP tool.
     """
-    import sqlite3
-    from mcp_server import DB_PATH
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT sku_id, name, category, unit_cost, selling_price, current_stock FROM skus")
-            rows = cursor.fetchall()
+        skus = tool_get_all_skus(location_id=location_id)
+        # Format response matching exact expected schema for frontend compatibility
         return [
             {
-                "sku_id": r[0],
-                "item_name": r[1],
-                "category": r[2],
-                "unit_cost": r[3],
-                "selling_price": r[4],
-                "current_stock": r[5]
+                "sku_id": s["sku_id"],
+                "item_name": s["name"],
+                "category": s["category"],
+                "unit_cost": s["unit_cost"],
+                "selling_price": s["selling_price"],
+                "current_stock": s["current_stock"]
             }
-            for r in rows
+            for s in skus
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error fetching SKUs: {str(e)}")
@@ -517,20 +492,18 @@ def get_all_skus():
 @app.post("/update-sku")
 def update_sku(req: UpdateSKURequest):
     """
-    Updates cost, selling price, and current stock for a SKU.
+    Updates cost, selling price, and current stock for a SKU via tool_update_sku_metadata MCP tool.
     """
-    import sqlite3
-    from mcp_server import DB_PATH
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE skus SET unit_cost = ?, selling_price = ?, current_stock = ? WHERE sku_id = ?",
-                (req.unit_cost, req.selling_price, req.current_stock, req.sku_id)
-            )
-            conn.commit()
-            if cursor.rowcount == 0:
-                raise HTTPException(status_code=404, detail=f"SKU '{req.sku_id}' not found.")
+        res = tool_update_sku_metadata(
+            sku_id=req.sku_id,
+            unit_cost=req.unit_cost,
+            selling_price=req.selling_price,
+            current_stock=req.current_stock,
+            location_id=req.location_id
+        )
+        if res.get("status") == "error":
+            raise HTTPException(status_code=404, detail=res.get("message"))
         return {"status": "success", "message": "SKU updated successfully"}
     except HTTPException:
         raise
@@ -541,53 +514,39 @@ def update_sku(req: UpdateSKURequest):
 @app.post("/add-sku")
 def add_sku(req: AddSKURequest):
     """
-    Adds a new SKU to inveniq.db.
+    Adds a new SKU to database via tool_add_new_sku MCP tool.
     """
-    import sqlite3
-    from mcp_server import DB_PATH
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            if not req.sku_id:
-                cursor.execute("SELECT COUNT(*) FROM skus")
-                count = cursor.fetchone()[0] + 1
-                sku_id = f"SKU_{count:03d}"
-            else:
-                sku_id = req.sku_id
+        if not req.sku_id:
+            existing = tool_get_all_skus()
+            sku_id = f"SKU_{len(existing) + 1:03d}"
+        else:
+            sku_id = req.sku_id
 
-            cursor.execute(
-                "INSERT INTO skus (sku_id, name, category, unit_cost, selling_price, current_stock) VALUES (?, ?, ?, ?, ?, ?)",
-                (sku_id, req.name, req.category, req.unit_cost, req.selling_price, req.current_stock)
-            )
-            conn.commit()
+        tool_add_new_sku(
+            sku_id=sku_id,
+            name=req.name,
+            category=req.category,
+            unit_cost=req.unit_cost,
+            selling_price=req.selling_price,
+            current_stock=req.current_stock,
+            location_id=req.location_id
+        )
         return {"status": "success", "message": "New SKU added", "sku_id": sku_id}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail=f"SKU with ID '{req.sku_id}' already exists.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error adding SKU: {str(e)}")
 
 
 @app.get("/khata-ledger")
-def get_khata_ledger():
+def get_khata_ledger(customer_id: Optional[str] = None):
     """
-    Returns all customer Khata entries from inveniq.db.
+    Returns all customer Khata entries from database via tool_get_khata_ledger MCP tool.
     """
-    import sqlite3
-    from mcp_server import DB_PATH
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT customer_id, customer_name, segment, debit_balance FROM khata_ledger")
-            rows = cursor.fetchall()
-        return [
-            {
-                "customer_id": r[0],
-                "customer_name": r[1],
-                "segment": r[2],
-                "debit_balance": r[3]
-            }
-            for r in rows
-        ]
+        result = tool_get_khata_ledger(customer_id=customer_id)
+        if isinstance(result, dict):
+            return [result]
+        return result if result is not None else []
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error fetching Khata ledger: {str(e)}")
 
@@ -595,4 +554,3 @@ def get_khata_ledger():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
