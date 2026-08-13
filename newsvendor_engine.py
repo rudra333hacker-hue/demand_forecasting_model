@@ -16,12 +16,16 @@ from mcp_server import tool_get_product_cost, tool_get_khata_balance, tool_get_s
 
 def calculate_critical_fractile(unit_cost: float, selling_price: float) -> float:
     """
-    Calculates the Critical Fractile (CF) for a given product.
+    Calculates the Critical Fractile (CF) for a given product using cost-aware asymmetric loss math.
     
     Formula:
-      Cu (Cost of Understocking) = selling_price - unit_cost
-      Co (Cost of Overstocking) = unit_cost * 0.30
+      Cu (Cost of Understocking / Lost Profit) = selling_price - unit_cost
+      Co (Cost of Overstocking / Holding & Spoilage) = unit_cost * 0.30
       CF = Cu / (Cu + Co)
+      
+    Interpretation:
+      - High margin items (Cu >> Co) yield CF near 1.0 -> order higher safety stock to prevent lost sales.
+      - Low margin items (Cu < Co) yield lower CF -> order conservatively to prevent excess inventory holding costs.
     """
     if unit_cost <= 0 or selling_price <= unit_cost:
         return 0.0
@@ -39,7 +43,8 @@ def calculate_critical_fractile(unit_cost: float, selling_price: float) -> float
 
 def optimize_order_quantity(
     sku_id: str,
-    raw_demand_forecast: Union[float, int, dict, list, np.ndarray]
+    raw_demand_forecast: Union[float, int, dict, list, np.ndarray],
+    location_id: Optional[str] = None
 ) -> dict:
     """
     Queries SKU metadata via tool_get_product_cost and calculates optimal order quantity Q*
@@ -52,6 +57,7 @@ def optimize_order_quantity(
     unit_cost = float(product_cost_info["unit_cost"])
     selling_price = float(product_cost_info["selling_price"])
     current_stock = int(product_cost_info.get("current_stock", 0))
+    substitute_sku_id = product_cost_info.get("substitute_sku_id")
 
     cf = calculate_critical_fractile(unit_cost, selling_price)
 
@@ -73,7 +79,6 @@ def optimize_order_quantity(
         target_stock_level = current_stock
         optimal_order_qty = 0
     else:
-        # Fetch supplier lead time via MCP tool
         try:
             lead_info = tool_get_supplier_lead_time(sku_id)
         except Exception:
@@ -101,7 +106,6 @@ def optimize_order_quantity(
     sharpe_ratio = round(profit_margin_pct / (demand_cv + 0.10), 3)
 
     # Financial Value at Risk (VaR 95% worst-case downside loss bound)
-    # Demand at 5th percentile worst-case scenario
     worst_case_demand_5pct = max(0.0, mean_demand - 1.645 * std_demand)
     unsold_units_risk = max(0.0, (current_stock + optimal_order_qty) - worst_case_demand_5pct)
     var_95_loss_inr = round(unsold_units_risk * unit_cost * 0.30, 2)  # Overage holding/spoilage loss
@@ -111,6 +115,7 @@ def optimize_order_quantity(
         "unit_cost": unit_cost,
         "selling_price": selling_price,
         "current_stock": current_stock,
+        "substitute_sku_id": substitute_sku_id,
         "critical_fractile": round(cf, 4),
         "sharpe_ratio": sharpe_ratio,
         "var_95_loss_inr": var_95_loss_inr,
@@ -123,12 +128,14 @@ def optimize_order_quantity(
 def allocate_portfolio_budget(
     orders_list: List[dict],
     total_budget_inr: float,
-    customer_id: Optional[str] = None
+    customer_id: Optional[str] = None,
+    location_id: Optional[str] = None
 ) -> dict:
     """
     Markowitz Mean-Variance Portfolio Budget Optimizer:
     Allocates available budget across candidate SKU orders ranked by Risk-Adjusted Sharpe Ratio & Critical Fractile.
     Deducts 10% of customer Khata debit balance if customer_id is provided.
+    Applies a 10% correlation discount on substitute products to avoid double-ordering correlated items.
     Calculates Portfolio Expected Profit and 95% Value at Risk (VaR) downside loss bound.
     """
     khata_deduction = 0.0
@@ -155,11 +162,18 @@ def allocate_portfolio_budget(
     allocated_orders = []
     total_expected_profit = 0.0
     total_var_95_loss = 0.0
+    allocated_skus = set()
 
     for order in sorted_orders:
+        sku_id = order.get("sku_id")
         unit_cost = float(order.get("unit_cost", 0.0))
         selling_price = float(order.get("selling_price", 0.0))
         requested_qty = int(order.get("optimal_order_quantity", order.get("order_quantity", 0)))
+        substitute_sku_id = order.get("substitute_sku_id")
+
+        # Apply substitute correlation discount if a substitute SKU was already allocated in portfolio
+        if substitute_sku_id and substitute_sku_id in allocated_skus:
+            requested_qty = max(1, int(round(requested_qty * 0.90)))
 
         if unit_cost > 0:
             affordable_qty = min(requested_qty, int(remaining_budget // unit_cost))
@@ -183,6 +197,8 @@ def allocate_portfolio_budget(
         allocated_order["fulfilled"] = (affordable_qty == requested_qty)
 
         allocated_orders.append(allocated_order)
+        if sku_id:
+            allocated_skus.add(sku_id)
 
     return {
         "initial_budget": float(total_budget_inr),
