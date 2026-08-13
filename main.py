@@ -305,6 +305,7 @@ def save_khata_note(req: KhataVoiceNoteRequest):
 def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
     """
     Parses natural language commands from the shopkeeper and updates via MCP server tools.
+    Supports stock updates, price updates, cost updates, missing demand logging, and Khata updates.
     """
     import re
     from datetime import datetime
@@ -314,23 +315,39 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
     try:
         skus = tool_get_all_skus()
         target_sku = None
-        for s in skus:
-            sku_id = s["sku_id"]
-            name = s["name"]
-            if sku_id.lower() in msg_lower:
-                target_sku = s
-                break
-            name_words = [w.lower() for w in name.split() if len(w) > 3]
-            if any(w in msg_lower for w in name_words):
-                target_sku = s
-                break
+        stop_words = {"the", "for", "and", "with", "item", "this", "that", "from", "into", "units", "unit", "pack", "bags", "bag", "bottle", "bottles"}
+
+        # 1. Match SKU ID first (e.g., SKU_001, SKU 001, sku_1, sku 1)
+        sku_match = re.search(r'sku[_\s]?0*(\d+)', msg_lower)
+        if sku_match:
+            sku_num = int(sku_match.group(1))
+            target_sku_id = f"SKU_{sku_num:03d}"
+            for s in skus:
+                if s["sku_id"].lower() == target_sku_id.lower():
+                    target_sku = s
+                    break
+
+        # 2. Match SKU name if SKU ID not found directly
+        if not target_sku:
+            for s in skus:
+                sku_id = s["sku_id"]
+                name = s["name"]
+                if sku_id.lower() in msg_lower:
+                    target_sku = s
+                    break
+                # Match name keywords >= 3 chars excluding stop words (e.g., Rice, Milk, Dal, Chips)
+                name_words = [w.lower() for w in re.findall(r'\b[a-zA-Z0-9]+\b', name) if len(w) >= 3 and w.lower() not in stop_words]
+                if any(w in msg_lower for w in name_words):
+                    target_sku = s
+                    break
 
         numbers = [float(n) for n in re.findall(r'\b\d+(?:\.\d+)?\b', message)]
 
-        # 1. Update Stock
-        if any(k in msg_lower for k in ["stock", "quantity", "inventory", "count"]) and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "add" in msg_lower or "make" in msg_lower):
+        # --- Intent 1: Stock Update ---
+        if any(k in msg_lower for k in ["stock", "quantity", "inventory", "count", "available"]):
             if target_sku and numbers:
-                new_stock = int(numbers[-1])
+                clean_numbers = [n for n in numbers if int(n) != int(re.sub(r'\D', '', target_sku['sku_id']))]
+                new_stock = int(clean_numbers[-1]) if clean_numbers else int(numbers[-1])
                 sku_id = target_sku["sku_id"]
                 name = target_sku["name"]
                 old_stock = target_sku["current_stock"]
@@ -340,10 +357,11 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
                     "db_updated": True
                 }
 
-        # 2. Update Selling Price
-        if "price" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
+        # --- Intent 2: Selling Price Update ---
+        if "price" in msg_lower or "selling price" in msg_lower or "rate" in msg_lower or "mrp" in msg_lower:
             if target_sku and numbers:
-                new_price = float(numbers[-1])
+                clean_numbers = [n for n in numbers if int(n) != int(re.sub(r'\D', '', target_sku['sku_id']))]
+                new_price = float(clean_numbers[-1]) if clean_numbers else float(numbers[-1])
                 sku_id = target_sku["sku_id"]
                 name = target_sku["name"]
                 old_price = target_sku["selling_price"]
@@ -353,10 +371,11 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
                     "db_updated": True
                 }
 
-        # 3. Update Unit Cost
-        if "cost" in msg_lower and ("set" in msg_lower or "update" in msg_lower or "change" in msg_lower or "to" in msg_lower or "is" in msg_lower or "make" in msg_lower):
+        # --- Intent 3: Unit Cost Update ---
+        if "cost" in msg_lower or "purchase price" in msg_lower or "buy price" in msg_lower:
             if target_sku and numbers:
-                new_cost = float(numbers[-1])
+                clean_numbers = [n for n in numbers if int(n) != int(re.sub(r'\D', '', target_sku['sku_id']))]
+                new_cost = float(clean_numbers[-1]) if clean_numbers else float(numbers[-1])
                 sku_id = target_sku["sku_id"]
                 name = target_sku["name"]
                 old_cost = target_sku["unit_cost"]
@@ -366,10 +385,11 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
                     "db_updated": True
                 }
 
-        # 4. Log Missing / Unmet Demand
-        if any(k in msg_lower for k in ["missing", "unmet", "stockout", "out of stock", "shortage"]):
+        # --- Intent 4: Log Unmet / Missing Demand ---
+        if any(k in msg_lower for k in ["missing", "unmet", "stockout", "out of stock", "shortage", "lost"]):
             if target_sku and numbers:
-                missing_qty = int(numbers[0])
+                clean_numbers = [n for n in numbers if int(n) != int(re.sub(r'\D', '', target_sku['sku_id']))]
+                missing_qty = int(clean_numbers[0]) if clean_numbers else int(numbers[0])
                 sku_id = target_sku["sku_id"]
                 name = target_sku["name"]
                 today = datetime.now().strftime("%Y-%m-%d")
@@ -379,7 +399,7 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
                     "db_updated": True
                 }
 
-        # 5. Update Khata Debit Balance
+        # --- Intent 5: Update Khata Debit Balance ---
         if any(k in msg_lower for k in ["khata", "debit", "credit", "balance", "owe", "due"]):
             if numbers:
                 amount = float(numbers[-1])
@@ -389,7 +409,7 @@ def execute_chat_db_command(message: str) -> Optional[Dict[str, Any]]:
                     for c in customers:
                         cid = c["customer_id"]
                         cname = c["customer_name"]
-                        if cid.lower() in msg_lower or any(w.lower() in msg_lower for w in cname.split() if len(w) > 2):
+                        if cid.lower() in msg_lower or any(w.lower() in msg_lower for w in cname.split() if len(w) >= 3 and w.lower() not in stop_words):
                             target_cust = c
                             break
                 if target_cust:
@@ -553,4 +573,4 @@ def get_khata_ledger(customer_id: Optional[str] = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
