@@ -100,13 +100,14 @@ def populate_database():
     cursor.execute("DELETE FROM holidays_calendar")
     cursor.execute("DELETE FROM supplier_lead_times")
 
-    # 2. Insert SKUs (sku_id, name, category, unit_cost, selling_price, current_stock, location_id, substitute_sku_id)
+    # 2. Insert SKUs (SKU_003 and SKU_006 are tagged as substitute beverages, for portfolio correlation demo)
     skus_data = [
-        ("SKU_001", "Basmati Rice 5kg", "Staples", 250.0, 320.0, 50, "LOC_001", "SKU_005"),
+        ("SKU_001", "Basmati Rice 5kg", "Staples", 250.0, 320.0, 50, "LOC_001", None),
         ("SKU_002", "Full Cream Milk 1L", "Dairy", 45.0, 55.0, 30, "LOC_001", None),
-        ("SKU_003", "Mango Drink 1L", "Beverages", 65.0, 90.0, 20, "LOC_001", "SKU_004"),
-        ("SKU_004", "Potato Chips 100g", "Snacks", 15.0, 20.0, 40, "LOC_001", "SKU_003"),
-        ("SKU_005", "Toor Dal 1kg", "Staples", 110.0, 140.0, 25, "LOC_001", "SKU_001"),
+        ("SKU_003", "Mango Drink 1L", "Beverages", 65.0, 90.0, 20, "LOC_001", "SKU_006"),
+        ("SKU_004", "Potato Chips 100g", "Snacks", 15.0, 20.0, 40, "LOC_001", None),
+        ("SKU_005", "Toor Dal 1kg", "Staples", 110.0, 140.0, 25, "LOC_001", None),
+        ("SKU_006", "Guava Drink 1L", "Beverages", 60.0, 85.0, 15, "LOC_001", "SKU_003"),
     ]
     cursor.executemany("INSERT INTO skus VALUES (?, ?, ?, ?, ?, ?, ?, ?)", skus_data)
 
@@ -137,6 +138,10 @@ def populate_database():
         # SKU_005 (Staple: Stable demand around 20 ± 2)
         qty_005 = round(20.0 + random.normalvariate(0, 2), 1)
         sales_entries.append(("SKU_005", current_date, max(5.0, qty_005)))
+
+        # SKU_006 (Beverages: Volatile demand, substitute for SKU_003)
+        qty_006 = round(35.0 + random.uniform(-12, 12) + (6 if day_offset % 7 in [5, 6] else 0), 1)
+        sales_entries.append(("SKU_006", current_date, max(8.0, qty_006)))
 
     cursor.executemany("INSERT INTO sales_history (sku_id, date, quantity_sold) VALUES (?, ?, ?)", sales_entries)
 
@@ -179,6 +184,7 @@ def populate_database():
         ("SKU_003", 2, 0.4, 12),
         ("SKU_004", 2, 0.3, 20),
         ("SKU_005", 3, 0.5, 10),
+        ("SKU_006", 2, 0.4, 12),
     ]
     cursor.executemany("INSERT INTO supplier_lead_times VALUES (?, ?, ?, ?)", lead_time_data)
 
