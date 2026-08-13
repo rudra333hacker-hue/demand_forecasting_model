@@ -63,8 +63,10 @@ def optimize_order_quantity(
 
     # Extract mean demand and daily std dev
     if isinstance(raw_demand_forecast, dict):
-        mean_demand = float(raw_demand_forecast.get("mean", raw_demand_forecast.get("forecast", 0.0)))
-        std_demand = float(raw_demand_forecast.get("std", raw_demand_forecast.get("std_dev", mean_demand * 0.20)))
+        raw_mean = raw_demand_forecast.get("mean") or raw_demand_forecast.get("forecast") or 0.0
+        mean_demand = float(raw_mean)
+        raw_std = raw_demand_forecast.get("std") or raw_demand_forecast.get("std_dev") or (mean_demand * 0.20)
+        std_demand = float(raw_std)
     elif isinstance(raw_demand_forecast, (list, np.ndarray)):
         mean_demand = float(np.mean(raw_demand_forecast)) if len(raw_demand_forecast) > 0 else 0.0
         std_demand = float(np.std(raw_demand_forecast)) if len(raw_demand_forecast) > 0 and np.std(raw_demand_forecast) > 0 else max(1.0, mean_demand * 0.20)
@@ -168,7 +170,7 @@ def allocate_portfolio_budget(
         sku_id = order.get("sku_id")
         unit_cost = float(order.get("unit_cost", 0.0))
         selling_price = float(order.get("selling_price", 0.0))
-        requested_qty = int(order.get("optimal_order_quantity", order.get("order_quantity", 0)))
+        requested_qty = int(order.get("optimal_order_quantity") or order.get("order_quantity") or 0)
         substitute_sku_id = order.get("substitute_sku_id")
 
         # Apply substitute correlation discount if a substitute SKU was already allocated in portfolio
