@@ -476,6 +476,8 @@
 
   <!-- JavaScript Logic -->
   <script>
+    const API_BASE = (window.location.protocol.startsWith('http') && window.location.host) ? '' : 'http://localhost:8000';
+
     // System Available SKUs Metadata (Synced dynamically from inveniq.db)
     let SYSTEM_SKUS = [
       { id: 'SKU_001', name: 'Basmati Rice 5kg', cat: 'Staples', cost: 250, price: 320, selected: true },
@@ -503,7 +505,7 @@
     // Fetch live SKUs from inveniq.db via GET /skus
     async function fetchSKUsFromDB() {
       try {
-        const res = await fetch('/skus');
+        const res = await fetch(`${API_BASE}/skus`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const dbSkus = await res.json();
         if (dbSkus && dbSkus.length > 0) {
@@ -530,7 +532,7 @@
     // Fetch live Khata ledger from inveniq.db via GET /khata-ledger
     async function loadKhataDropdowns() {
       try {
-        const res = await fetch('/khata-ledger');
+        const res = await fetch(`${API_BASE}/khata-ledger`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         KHATA_CUSTOMERS = await res.json();
         renderKhataDropdowns();
@@ -621,7 +623,7 @@
       }
 
       try {
-        const res = await fetch('/update-sku', {
+        const res = await fetch(`${API_BASE}/update-sku`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -660,7 +662,7 @@
       }
 
       try {
-        const res = await fetch('/add-sku', {
+        const res = await fetch(`${API_BASE}/add-sku`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -745,7 +747,7 @@
       }
 
       try {
-        const response = await fetch('/optimize-restock', {
+        const response = await fetch(`${API_BASE}/optimize-restock`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -856,7 +858,7 @@
       badge.innerText = 'Calling NVIDIA NIM...';
 
       try {
-        const res = await fetch('/generate-nim-insights', {
+        const res = await fetch(`${API_BASE}/generate-nim-insights`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ restock_plan: plan })
@@ -890,7 +892,7 @@
       const segment = document.getElementById('unmet-segment').value;
 
       try {
-        const res = await fetch('/log-demand', {
+        const res = await fetch(`${API_BASE}/log-demand`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -978,7 +980,7 @@
       }
 
       try {
-        const res = await fetch('/save-khata-note', {
+        const res = await fetch(`${API_BASE}/save-khata-note`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ customer_id: customer, note: note })
@@ -1100,7 +1102,7 @@
       messagesContainer.scrollTop = messagesContainer.scrollHeight;
 
       try {
-        const response = await fetch('/chat', {
+        const response = await fetch(`${API_BASE}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ message: userText })
