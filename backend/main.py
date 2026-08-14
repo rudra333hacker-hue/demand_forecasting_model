@@ -43,6 +43,8 @@ def startup_event():
         print("inveniq.db not found. Auto-populating database on startup...")
         populate_database()
 
+from fastapi.staticfiles import StaticFiles
+
 # CORS middleware for cross-origin frontend access
 app.add_middleware(
     CORSMiddleware,
@@ -51,6 +53,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+frontend_dir = os.path.join(_PROJECT_ROOT, "frontend")
+if os.path.exists(frontend_dir):
+    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
 # --- Pydantic Models for Input Validation ---
 
@@ -71,9 +77,12 @@ class OptimizeRestockRequest(BaseModel):
 
 class LogDemandRequest(BaseModel):
     sku_id: str = Field(..., examples=["SKU_001"])
-    date_str: str = Field(..., examples=["2026-08-13"])
-    unmet_quantity: int = Field(..., gt=0, examples=[5])
-    segment: str = Field("Regular", examples=["Regular"])
+    date_str: Optional[str] = Field(None, examples=["2026-08-13"])
+    date: Optional[str] = Field(None, examples=["2026-08-13"])
+    unmet_quantity: Optional[int] = Field(None, examples=[5])
+    unmet_qty: Optional[int] = Field(None, examples=[5])
+    segment: Optional[str] = Field("Regular", examples=["Regular"])
+    customer_segment: Optional[str] = Field(None, examples=["Regular"])
     location_id: Optional[str] = Field(None, examples=["LOC_001"])
 
 
@@ -192,11 +201,15 @@ def log_unmet_demand(req: LogDemandRequest):
     4. Calls tool_log_manual_demand from mcp_server.py to record unfulfilled demand.
     """
     try:
+        from datetime import datetime
+        d_str = req.date_str or req.date or datetime.now().strftime("%Y-%m-%d")
+        qty = req.unmet_quantity if req.unmet_quantity is not None else (req.unmet_qty if req.unmet_qty is not None else 1)
+        seg = req.customer_segment or req.segment or "Regular"
         result = tool_log_manual_demand(
             sku_id=req.sku_id,
-            date_str=req.date_str,
-            unmet_quantity=req.unmet_quantity,
-            customer_segment=req.segment,
+            date_str=d_str,
+            unmet_quantity=qty,
+            customer_segment=seg,
             location_id=req.location_id
         )
         return result
